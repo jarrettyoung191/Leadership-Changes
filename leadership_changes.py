@@ -34,18 +34,26 @@ OUTPUT_FILE = "leadership_changes_results.json"
 # -----------------------------------------------------------------------
 
 HEADERS = {
-    # SEC requires a real User-Agent identifying you/your use case
-    "User-Agent": "Jarrett - Element2Group BD Research jarrett@example.com"
+    # SEC requires a real User-Agent identifying you/your use case.
+    # Replace with your actual name/email before running.
+    "User-Agent": "Jarrett - Element2Group BD Research jarrett@example.com",
+    "Accept": "application/json",
 }
 
 BASE_URL = "https://efts.sec.gov/LATEST/search-index"
 
+MAX_RETRIES = 3
 
-def is_manufacturing_sic(sic: str) -> bool:
-    """Rough filter: SIC codes 2000-3999 are manufacturing."""
-    if not sic or not sic.isdigit():
+
+def is_manufacturing_sic(sic) -> bool:
+    """Rough filter: SIC codes 2000-3999 are manufacturing.
+    Handles missing/non-numeric SIC values safely (some hits omit it)."""
+    if not sic:
         return False
-    return 2000 <= int(sic) <= 3999
+    sic_str = str(sic).strip()
+    if not sic_str.isdigit():
+        return False
+    return 2000 <= int(sic_str) <= 3999
 
 
 def fetch_filings():
@@ -58,16 +66,27 @@ def fetch_filings():
         "dateRange": "custom",
         "startdt": start.strftime("%Y-%m-%d"),
         "enddt": end.strftime("%Y-%m-%d"),
-        "locationCode": LOCATION_CODE,
+        "locationCodes": LOCATION_CODE,  # plural param name per EDGAR API
     }
 
     all_hits = []
     frm = 0
     while True:
         params["from"] = frm
-        resp = requests.get(BASE_URL, headers=HEADERS, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+
+        data = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.get(BASE_URL, headers=HEADERS, params=params, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except requests.exceptions.RequestException as e:
+                print(f"  [warn] request failed (attempt {attempt}/{MAX_RETRIES}): {e}")
+                if attempt == MAX_RETRIES:
+                    print("  [error] giving up on this page, stopping pagination.")
+                    return all_hits
+                time.sleep(1.5 * attempt)  # simple backoff
 
         hits = data.get("hits", {}).get("hits", [])
         if not hits:
@@ -87,7 +106,10 @@ def fetch_filings():
 
 def build_filing_url(hit):
     adsh, fname = hit["_id"].split(":", 1)
-    cik = int(hit["_source"]["ciks"][0])
+    ciks = hit.get("_source", {}).get("ciks", [])
+    if not ciks:
+        return None
+    cik = int(ciks[0])
     folder = adsh.replace("-", "")
     return f"https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{fname}"
 
@@ -105,9 +127,11 @@ def main():
             continue  # only keep filings that actually flagged 5.02
 
         sic = src.get("sic", "")
-        company = ", ".join(src.get("display_names", []))
+        company = ", ".join(src.get("display_names", [])) or "Unknown company"
         filed = src.get("file_date", "")
         url = build_filing_url(hit)
+        if url is None:
+            continue
 
         result = {
             "company": company,
